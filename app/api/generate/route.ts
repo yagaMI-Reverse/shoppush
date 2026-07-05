@@ -82,26 +82,37 @@ export async function POST(request: Request) {
       const data = await res.json();
       raw = data.choices?.[0]?.message?.content ?? "{}";
     } else {
-      const res = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-            contents: [{ role: "user", parts: [{ text: userPrompt }] }],
-            generationConfig: {
-              temperature: 0.7,
-              responseMimeType: "application/json",
-            },
-          }),
-        }
-      );
-      if (!res.ok) {
-        const detail = await res.text();
-        console.error("Gemini error:", res.status, detail.slice(0, 300));
+      // Gemini free tier throws transient 429/503 under load — absorb them
+      // with bounded retries + backoff instead of surfacing every blip.
+      let res: Response | null = null;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if (attempt > 0)
+          await new Promise((r) => setTimeout(r, 700 * 2 ** attempt));
+        res = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+              contents: [{ role: "user", parts: [{ text: userPrompt }] }],
+              generationConfig: {
+                temperature: 0.7,
+                responseMimeType: "application/json",
+              },
+            }),
+          }
+        );
+        if (res.ok) break;
+        const retryable = res.status === 429 || res.status >= 500;
+        console.error(`Gemini error (attempt ${attempt + 1}):`, res.status);
+        if (!retryable) break;
+      }
+      if (!res || !res.ok) {
         return Response.json(
-          { error: `AI provider returned ${res.status}. Try again in a moment.` },
+          {
+            error: `AI provider is overloaded right now (${res?.status ?? "?"}). I retried 3 times — give it a minute and try again.`,
+          },
           { status: 502 }
         );
       }
